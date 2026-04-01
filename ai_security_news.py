@@ -9,11 +9,13 @@ import re
 import sys
 import time
 
-import anthropic
 import feedparser
 import requests
 
 # --- Configuration ---
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 GNEWS_API_URL = "https://gnews.io/api/v4/search"
 
@@ -101,6 +103,44 @@ Return a JSON array with your summaries. Format:
 ]
 
 Return ONLY the JSON array, no other text."""
+
+
+# --- LLM ---
+
+
+def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
+    """Call Groq API and return the response text."""
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set.")
+
+    resp = requests.post(
+        GROQ_API_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _parse_json_response(text: str) -> list:
+    """Parse JSON from LLM response, handling markdown fences."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"```json?\s*(.*?)```", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        raise ValueError("Could not parse JSON from LLM response.")
 
 
 # --- Fetching ---
@@ -211,8 +251,8 @@ def deduplicate(articles: list[dict]) -> list[dict]:
 # --- Ranking ---
 
 
-def rank_articles_with_claude(articles: list[dict]) -> list[dict]:
-    """Rank articles by AI security relevance using Claude."""
+def rank_articles(articles: list[dict]) -> list[dict]:
+    """Rank articles by AI security relevance using Groq."""
     if not articles:
         return []
 
@@ -228,23 +268,8 @@ def rank_articles_with_claude(articles: list[dict]) -> list[dict]:
     prompt = RANKING_PROMPT.format(articles=numbered_list)
 
     try:
-        client = anthropic.Anthropic()
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        response_text = message.content[0].text
-
-        # Parse JSON — try direct, then try extracting from markdown fence
-        try:
-            rankings = json.loads(response_text)
-        except json.JSONDecodeError:
-            match = re.search(r"```json?\s*(.*?)```", response_text, re.DOTALL)
-            if match:
-                rankings = json.loads(match.group(1))
-            else:
-                raise ValueError("Could not parse JSON from Claude response.")
+        response_text = _call_groq(prompt)
+        rankings = _parse_json_response(response_text)
 
         # Merge rankings back into articles
         ranked = []
@@ -257,11 +282,11 @@ def rank_articles_with_claude(articles: list[dict]) -> list[dict]:
                 article["rank"] = entry.get("rank", 0)
                 ranked.append(article)
 
-        print(f"Claude ranked {len(ranked)} articles.")
+        print(f"Ranked {len(ranked)} articles via Groq ({GROQ_MODEL}).")
         return ranked
 
     except Exception as e:
-        print(f"Warning: Claude ranking failed: {e}")
+        print(f"Warning: Ranking failed: {e}")
         print("Falling back to unranked results (most recent first).")
         for i, article in enumerate(articles_to_rank[:10]):
             article["relevance_score"] = 0
@@ -286,22 +311,8 @@ def generate_witty_summaries(top_articles: list[dict]) -> list[dict]:
     prompt = WITTY_SUMMARY_PROMPT.format(articles=articles_text)
 
     try:
-        client = anthropic.Anthropic()
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        response_text = message.content[0].text
-
-        try:
-            summaries = json.loads(response_text)
-        except json.JSONDecodeError:
-            match = re.search(r"```json?\s*(.*?)```", response_text, re.DOTALL)
-            if match:
-                summaries = json.loads(match.group(1))
-            else:
-                raise ValueError("Could not parse JSON from Claude response.")
+        response_text = _call_groq(prompt)
+        summaries = _parse_json_response(response_text)
 
         for entry in summaries:
             idx = entry.get("article_number", 0) - 1
@@ -353,7 +364,7 @@ def create_github_issue(ranked_articles: list[dict]) -> None:
     # Build issue body
     body_lines = [
         f"# AI Security News Digest — {today}\n",
-        "> Automatically generated daily digest of AI security news, ranked by relevance using Claude.\n",
+        "> Automatically generated daily digest of AI security news, ranked by relevance using Llama on Groq.\n",
     ]
 
     # Featured top 3 with witty summaries
@@ -387,7 +398,7 @@ def create_github_issue(ranked_articles: list[dict]) -> None:
 
     body_lines.append("## Methodology")
     body_lines.append(f"- **News sources:** GNews API + {len(RSS_FEEDS)} RSS feeds")
-    body_lines.append(f"- **Ranking model:** claude-sonnet-4-20250514")
+    body_lines.append(f"- **Ranking model:** {GROQ_MODEL} (via Groq)")
     body_lines.append(f"- **Generated:** {datetime.datetime.utcnow().isoformat()}Z")
 
     body = "\n".join(body_lines)
@@ -423,7 +434,7 @@ def main():
         print("No articles found. Exiting.")
         return
 
-    ranked = rank_articles_with_claude(all_articles)
+    ranked = rank_articles(all_articles)
     ranked = generate_witty_summaries(ranked)
     create_github_issue(ranked)
 
