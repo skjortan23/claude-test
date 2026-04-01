@@ -317,8 +317,8 @@ def rank_articles(articles: list[dict]) -> list[dict]:
     if not articles:
         return []
 
-    # Cap at 50 articles
-    articles_to_rank = articles[:50]
+    # Cap at 30 articles to stay within token limits
+    articles_to_rank = articles[:30]
 
     # Build numbered list
     numbered_list = "\n".join(
