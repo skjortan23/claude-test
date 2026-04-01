@@ -135,7 +135,7 @@ def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
             timeout=60,
         )
         if resp.status_code == 429:
-            wait = 2 ** (attempt + 1)
+            wait = 10 * (attempt + 1)
             print(f"Groq rate limited, waiting {wait}s...")
             time.sleep(wait)
             continue
@@ -497,6 +497,7 @@ def main():
         return
 
     ranked = rank_articles(all_articles)
+    time.sleep(10)  # cooldown to avoid Groq TPM rate limit
     ranked = generate_witty_summaries(ranked)
     create_github_issue(ranked)
 
