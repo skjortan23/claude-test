@@ -74,6 +74,34 @@ Return a JSON array ranking the top 10 most relevant articles. Format:
 Only include articles scoring 4 or above. If fewer than 10 qualify, return fewer.
 Return ONLY the JSON array, no other text."""
 
+WITTY_SUMMARY_PROMPT = """\
+You are a tech journalist with the sardonic wit of The Register and the irreverent \
+snark of old-school Slashdot editors. Write a short, punchy summary (2-3 paragraphs) \
+for each of the following AI security news articles. Your tone should be:
+
+- Tongue-in-cheek and slightly world-weary, like you've seen it all before
+- Sharp, opinionated, and entertaining — don't be afraid to editorialize
+- Technically accurate but accessible — no jargon soup
+- Think "seasoned hack who's had too much coffee and not enough patience for PR fluff"
+
+For each article, write a witty summary that captures the key facts while making \
+the reader smirk. Include a snarky subheadline for each one.
+
+Articles:
+
+{articles}
+
+Return a JSON array with your summaries. Format:
+[
+  {{
+    "article_number": 1,
+    "subheadline": "A short, snarky subheadline",
+    "witty_summary": "Your 2-3 paragraph witty summary here."
+  }}
+]
+
+Return ONLY the JSON array, no other text."""
+
 
 # --- Fetching ---
 
@@ -242,6 +270,53 @@ def rank_articles_with_claude(articles: list[dict]) -> list[dict]:
         return articles_to_rank[:10]
 
 
+# --- Witty Summaries ---
+
+
+def generate_witty_summaries(top_articles: list[dict]) -> list[dict]:
+    """Generate tongue-in-cheek summaries for the top 3 articles."""
+    if not top_articles:
+        return top_articles
+
+    articles_text = "\n\n".join(
+        f"{i + 1}. Title: {a['title']}\n   Source: {a['source']}\n   Summary: {a['summary']}"
+        for i, a in enumerate(top_articles[:3])
+    )
+
+    prompt = WITTY_SUMMARY_PROMPT.format(articles=articles_text)
+
+    try:
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = message.content[0].text
+
+        try:
+            summaries = json.loads(response_text)
+        except json.JSONDecodeError:
+            match = re.search(r"```json?\s*(.*?)```", response_text, re.DOTALL)
+            if match:
+                summaries = json.loads(match.group(1))
+            else:
+                raise ValueError("Could not parse JSON from Claude response.")
+
+        for entry in summaries:
+            idx = entry.get("article_number", 0) - 1
+            if 0 <= idx < len(top_articles):
+                top_articles[idx]["subheadline"] = entry.get("subheadline", "")
+                top_articles[idx]["witty_summary"] = entry.get("witty_summary", "")
+
+        print(f"Generated witty summaries for {len(summaries)} articles.")
+
+    except Exception as e:
+        print(f"Warning: Witty summary generation failed: {e}")
+
+    return top_articles
+
+
 # --- Output ---
 
 
@@ -279,19 +354,36 @@ def create_github_issue(ranked_articles: list[dict]) -> None:
     body_lines = [
         f"# AI Security News Digest — {today}\n",
         "> Automatically generated daily digest of AI security news, ranked by relevance using Claude.\n",
-        "## Top Stories\n",
     ]
 
-    for article in ranked_articles:
-        score = article.get("relevance_score", "N/A")
-        explanation = article.get("explanation", "")
-        body_lines.append(f"### {article['rank']}. [{article['title']}]({article['url']})")
-        body_lines.append(f"**Source:** {article['source']} | **Relevance:** {score}/10")
-        if explanation:
-            body_lines.append(f"> {explanation}")
-        if article.get("summary"):
-            body_lines.append(f"\n{article['summary'][:200]}...")
-        body_lines.append("\n---\n")
+    # Featured top 3 with witty summaries
+    top_3 = [a for a in ranked_articles if a.get("witty_summary")]
+    if top_3:
+        body_lines.append("## Featured Stories\n")
+        for article in top_3[:3]:
+            score = article.get("relevance_score", "N/A")
+            subheadline = article.get("subheadline", "")
+            body_lines.append(f"### {article['rank']}. [{article['title']}]({article['url']})")
+            if subheadline:
+                body_lines.append(f"*{subheadline}*\n")
+            body_lines.append(f"**Source:** {article['source']} | **Relevance:** {score}/10\n")
+            body_lines.append(article["witty_summary"])
+            body_lines.append("\n---\n")
+
+    # Remaining articles
+    remaining = [a for a in ranked_articles if not a.get("witty_summary")]
+    if remaining:
+        body_lines.append("## Also Noteworthy\n")
+        for article in remaining:
+            score = article.get("relevance_score", "N/A")
+            explanation = article.get("explanation", "")
+            body_lines.append(f"### {article['rank']}. [{article['title']}]({article['url']})")
+            body_lines.append(f"**Source:** {article['source']} | **Relevance:** {score}/10")
+            if explanation:
+                body_lines.append(f"> {explanation}")
+            if article.get("summary"):
+                body_lines.append(f"\n{article['summary'][:200]}...")
+            body_lines.append("\n---\n")
 
     body_lines.append("## Methodology")
     body_lines.append(f"- **News sources:** GNews API + {len(RSS_FEEDS)} RSS feeds")
@@ -332,6 +424,7 @@ def main():
         return
 
     ranked = rank_articles_with_claude(all_articles)
+    ranked = generate_witty_summaries(ranked)
     create_github_issue(ranked)
 
 
