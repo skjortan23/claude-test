@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Daily AI Security News Searcher — fetches, ranks, and posts a digest."""
+
+import datetime
+import html
+import json
+import os
+import re
+import sys
+import time
+
+import anthropic
+import feedparser
+import requests
+
+# --- Configuration ---
+
+GNEWS_API_URL = "https://gnews.io/api/v4/search"
+
+SEARCH_QUERIES = [
+    "AI security",
+    "artificial intelligence cybersecurity",
+    "LLM vulnerability",
+    "AI safety threat",
+    "machine learning attack",
+]
+
+RSS_FEEDS = {
+    "The Hacker News": "https://feeds.feedburner.com/TheHackersNews",
+    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
+    "Krebs on Security": "https://krebsonsecurity.com/feed/",
+    "Dark Reading": "https://www.darkreading.com/rss.xml",
+    "SecurityWeek": "https://feeds.feedburner.com/securityweek",
+    "Schneier on Security": "https://www.schneier.com/feed/atom/",
+    "MIT Tech Review AI": "https://www.technologyreview.com/topic/artificial-intelligence/feed",
+    "VentureBeat AI": "https://venturebeat.com/category/ai/feed/",
+    "The Register Security": "https://www.theregister.com/security/headlines.atom",
+    "Google Security Blog": "https://security.googleblog.com/feeds/posts/default",
+    "OpenAI Blog": "https://openai.com/blog/rss.xml",
+}
+
+RANKING_PROMPT = """\
+You are an AI security analyst. Evaluate the following news articles and rank them \
+by relevance to AI security — the intersection of artificial intelligence and \
+cybersecurity/safety.
+
+Highly relevant topics include:
+- Vulnerabilities in AI/ML systems (prompt injection, model poisoning, adversarial attacks)
+- AI-powered cyber threats (AI-generated malware, deepfakes for social engineering)
+- AI safety and alignment research with security implications
+- Regulatory and policy developments for AI security
+- Security of AI infrastructure (model supply chain, training data security)
+- Defensive uses of AI in cybersecurity
+
+Less relevant (score low):
+- General cybersecurity news with no AI angle
+- General AI news with no security angle
+- Product announcements without security relevance
+
+Here are today's articles:
+
+{articles}
+
+Return a JSON array ranking the top 10 most relevant articles. Format:
+[
+  {{
+    "rank": 1,
+    "article_number": 5,
+    "relevance_score": 9,
+    "explanation": "One sentence explaining why this is relevant to AI security."
+  }}
+]
+
+Only include articles scoring 4 or above. If fewer than 10 qualify, return fewer.
+Return ONLY the JSON array, no other text."""
+
+
+# --- Fetching ---
+
+
+def fetch_news_api_articles() -> list[dict]:
+    """Fetch articles from GNews API."""
+    api_key = os.environ.get("GNEWS_API_KEY", "")
+    if not api_key:
+        print("Warning: GNEWS_API_KEY not set, skipping News API.")
+        return []
+
+    articles = []
+    seen_urls = set()
+
+    for query in SEARCH_QUERIES:
+        try:
+            resp = requests.get(
+                GNEWS_API_URL,
+                params={"q": query, "lang": "en", "max": 10, "token": api_key},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            for item in data.get("articles", []):
+                url = item.get("url", "")
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                articles.append({
+                    "title": item.get("title", ""),
+                    "summary": (item.get("description") or "")[:500],
+                    "url": url,
+                    "source": item.get("source", {}).get("name", "Unknown"),
+                    "published": item.get("publishedAt", ""),
+                    "origin": "newsapi",
+                })
+        except Exception as e:
+            print(f"Warning: GNews query '{query}' failed: {e}")
+
+    print(f"Fetched {len(articles)} articles from GNews API.")
+    return articles
+
+
+def fetch_rss_articles() -> list[dict]:
+    """Fetch articles from RSS feeds, filtered to last 24 hours."""
+    cutoff = time.time() - 86400  # 24 hours ago
+    articles = []
+
+    for source_name, feed_url in RSS_FEEDS.items():
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries:
+                # Check publication date
+                published_parsed = getattr(entry, "published_parsed", None) or getattr(
+                    entry, "updated_parsed", None
+                )
+                if published_parsed:
+                    entry_time = time.mktime(published_parsed)
+                    if entry_time < cutoff:
+                        continue
+
+                # Extract and clean summary
+                raw_summary = getattr(entry, "summary", "") or getattr(
+                    entry, "description", ""
+                )
+                clean_summary = html.unescape(re.sub(r"<[^>]+>", "", raw_summary))[:500]
+
+                articles.append({
+                    "title": getattr(entry, "title", "No title"),
+                    "summary": clean_summary,
+                    "url": getattr(entry, "link", ""),
+                    "source": source_name,
+                    "published": getattr(entry, "published", ""),
+                    "origin": "rss",
+                })
+        except Exception as e:
+            print(f"Warning: RSS feed '{source_name}' failed: {e}")
+
+    print(f"Fetched {len(articles)} articles from RSS feeds.")
+    return articles
+
+
+# --- Deduplication ---
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL for deduplication."""
+    url = url.rstrip("/")
+    url = url.split("?")[0]
+    url = url.split("#")[0]
+    return url.lower()
+
+
+def deduplicate(articles: list[dict]) -> list[dict]:
+    """Remove duplicate articles by normalized URL."""
+    seen = set()
+    unique = []
+    for article in articles:
+        normalized = _normalize_url(article["url"])
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(article)
+    return unique
+
+
+# --- Ranking ---
+
+
+def rank_articles_with_claude(articles: list[dict]) -> list[dict]:
+    """Rank articles by AI security relevance using Claude."""
+    if not articles:
+        return []
+
+    # Cap at 50 articles
+    articles_to_rank = articles[:50]
+
+    # Build numbered list
+    numbered_list = "\n".join(
+        f"{i + 1}. [{a['title']}] — {a['summary']} (Source: {a['source']})"
+        for i, a in enumerate(articles_to_rank)
+    )
+
+    prompt = RANKING_PROMPT.format(articles=numbered_list)
+
+    try:
+        client = anthropic.Anthropic()
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = message.content[0].text
+
+        # Parse JSON — try direct, then try extracting from markdown fence
+        try:
+            rankings = json.loads(response_text)
+        except json.JSONDecodeError:
+            match = re.search(r"```json?\s*(.*?)```", response_text, re.DOTALL)
+            if match:
+                rankings = json.loads(match.group(1))
+            else:
+                raise ValueError("Could not parse JSON from Claude response.")
+
+        # Merge rankings back into articles
+        ranked = []
+        for entry in sorted(rankings, key=lambda x: x.get("rank", 99)):
+            idx = entry.get("article_number", 0) - 1
+            if 0 <= idx < len(articles_to_rank):
+                article = articles_to_rank[idx].copy()
+                article["relevance_score"] = entry.get("relevance_score", 0)
+                article["explanation"] = entry.get("explanation", "")
+                article["rank"] = entry.get("rank", 0)
+                ranked.append(article)
+
+        print(f"Claude ranked {len(ranked)} articles.")
+        return ranked
+
+    except Exception as e:
+        print(f"Warning: Claude ranking failed: {e}")
+        print("Falling back to unranked results (most recent first).")
+        for i, article in enumerate(articles_to_rank[:10]):
+            article["relevance_score"] = 0
+            article["explanation"] = "Ranking unavailable."
+            article["rank"] = i + 1
+        return articles_to_rank[:10]
+
+
+# --- Output ---
+
+
+def create_github_issue(ranked_articles: list[dict]) -> None:
+    """Create a GitHub issue with the daily digest."""
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not token or not repo:
+        print("Error: GITHUB_TOKEN or GITHUB_REPOSITORY not set.")
+        sys.exit(1)
+
+    today = datetime.date.today().isoformat()
+    title = f"AI Security News Digest — {today}"
+
+    # Check if today's issue already exists
+    try:
+        check_resp = requests.get(
+            f"https://api.github.com/repos/{repo}/issues",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            params={"labels": "daily-digest", "state": "open", "per_page": 5},
+            timeout=10,
+        )
+        if check_resp.ok:
+            for issue in check_resp.json():
+                if today in issue.get("title", ""):
+                    print(f"Issue for {today} already exists: {issue['html_url']}")
+                    return
+    except Exception:
+        pass  # Proceed with creation even if check fails
+
+    # Build issue body
+    body_lines = [
+        f"# AI Security News Digest — {today}\n",
+        "> Automatically generated daily digest of AI security news, ranked by relevance using Claude.\n",
+        "## Top Stories\n",
+    ]
+
+    for article in ranked_articles:
+        score = article.get("relevance_score", "N/A")
+        explanation = article.get("explanation", "")
+        body_lines.append(f"### {article['rank']}. [{article['title']}]({article['url']})")
+        body_lines.append(f"**Source:** {article['source']} | **Relevance:** {score}/10")
+        if explanation:
+            body_lines.append(f"> {explanation}")
+        if article.get("summary"):
+            body_lines.append(f"\n{article['summary'][:200]}...")
+        body_lines.append("\n---\n")
+
+    body_lines.append("## Methodology")
+    body_lines.append(f"- **News sources:** GNews API + {len(RSS_FEEDS)} RSS feeds")
+    body_lines.append(f"- **Ranking model:** claude-sonnet-4-20250514")
+    body_lines.append(f"- **Generated:** {datetime.datetime.utcnow().isoformat()}Z")
+
+    body = "\n".join(body_lines)
+
+    resp = requests.post(
+        f"https://api.github.com/repos/{repo}/issues",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "title": title,
+            "body": body,
+            "labels": ["ai-security", "daily-digest"],
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    print(f"Created issue: {resp.json()['html_url']}")
+
+
+# --- Main ---
+
+
+def main():
+    news_articles = fetch_news_api_articles()
+    rss_articles = fetch_rss_articles()
+
+    all_articles = deduplicate(news_articles + rss_articles)
+    print(f"Total unique articles: {len(all_articles)}")
+
+    if not all_articles:
+        print("No articles found. Exiting.")
+        return
+
+    ranked = rank_articles_with_claude(all_articles)
+    create_github_issue(ranked)
+
+
+if __name__ == "__main__":
+    main()
