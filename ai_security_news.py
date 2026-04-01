@@ -485,12 +485,38 @@ def create_github_issue(ranked_articles: list[dict]) -> None:
 # --- Main ---
 
 
-def main():
-    news_articles = fetch_news_api_articles()
-    rss_articles = fetch_rss_articles()
+SAMPLE_ARTICLES = [
+    {"title": "New prompt injection attack bypasses major LLM guardrails",
+     "summary": "Researchers discover a novel prompt injection technique that can bypass safety filters in GPT-4, Claude, and Gemini, allowing extraction of system prompts.",
+     "url": "https://example.com/prompt-injection", "source": "The Hacker News", "published": "2026-04-01", "origin": "rss"},
+    {"title": "Google patches critical Vertex AI vulnerability exposing cloud data",
+     "summary": "A security flaw in Google Cloud Vertex AI could allow attackers to weaponize AI agents to steal sensitive data and compromise cloud environments.",
+     "url": "https://example.com/vertex-ai", "source": "Dark Reading", "published": "2026-04-01", "origin": "rss"},
+    {"title": "AI-generated deepfake robocalls target voters ahead of elections",
+     "summary": "The FCC warns of a surge in AI-generated deepfake robocalls impersonating political candidates, raising concerns about election integrity.",
+     "url": "https://example.com/deepfake-robocalls", "source": "BleepingComputer", "published": "2026-04-01", "origin": "newsapi"},
+    {"title": "Novel prompt injection defeats LLM safety systems worldwide",
+     "summary": "Duplicate story about the same prompt injection attack to test topic dedup.",
+     "url": "https://example.com/prompt-injection-2", "source": "SecurityWeek", "published": "2026-04-01", "origin": "rss"},
+    {"title": "EU AI Act enforcement begins with security requirements for high-risk systems",
+     "summary": "The European Union begins enforcing its AI Act, requiring mandatory security audits for high-risk AI systems deployed in critical infrastructure.",
+     "url": "https://example.com/eu-ai-act", "source": "VentureBeat AI", "published": "2026-04-01", "origin": "rss"},
+]
 
-    all_articles = deduplicate(news_articles + rss_articles)
-    print(f"Unique articles by URL: {len(all_articles)}")
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+
+    if dry_run:
+        print("=== DRY RUN MODE (sample data) ===")
+        all_articles = list(SAMPLE_ARTICLES)
+        print(f"Loaded {len(all_articles)} sample articles.")
+    else:
+        news_articles = fetch_news_api_articles()
+        rss_articles = fetch_rss_articles()
+        all_articles = deduplicate(news_articles + rss_articles)
+        print(f"Unique articles by URL: {len(all_articles)}")
+
     all_articles = deduplicate_by_topic(all_articles)
     print(f"Unique articles by topic: {len(all_articles)}")
 
@@ -501,7 +527,22 @@ def main():
     ranked = rank_articles(all_articles)
     time.sleep(10)  # cooldown to avoid Groq TPM rate limit
     ranked = generate_witty_summaries(ranked)
-    create_github_issue(ranked)
+
+    if dry_run:
+        print("\n=== ISSUE PREVIEW ===")
+        for a in ranked:
+            score = a.get("relevance_score", "N/A")
+            print(f"\n[{a['rank']}] {a['title']} (Score: {score}/10)")
+            print(f"    Source: {a['source']}")
+            if a.get("explanation"):
+                print(f"    Why: {a['explanation']}")
+            if a.get("subheadline"):
+                print(f"    Subheadline: {a['subheadline']}")
+            if a.get("witty_summary"):
+                print(f"    Summary: {a['witty_summary'][:200]}...")
+        print("\n=== DRY RUN COMPLETE (no issue created) ===")
+    else:
+        create_github_issue(ranked)
 
 
 if __name__ == "__main__":
