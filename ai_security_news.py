@@ -109,27 +109,36 @@ Return ONLY the JSON array, no other text."""
 
 
 def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
-    """Call Groq API and return the response text."""
+    """Call Groq API with retry on rate limit."""
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         raise ValueError("GROQ_API_KEY not set.")
 
-    resp = requests.post(
-        GROQ_API_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0.7,
-        },
-        timeout=30,
-    )
+    for attempt in range(3):
+        resp = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+            },
+            timeout=60,
+        )
+        if resp.status_code == 429:
+            wait = 2 ** (attempt + 1)
+            print(f"Groq rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    return ""
 
 
 def _parse_json_response(text: str) -> list:
@@ -156,7 +165,9 @@ def fetch_news_api_articles() -> list[dict]:
     articles = []
     seen_urls = set()
 
-    for query in SEARCH_QUERIES:
+    for i, query in enumerate(SEARCH_QUERIES):
+        if i > 0:
+            time.sleep(1)  # avoid rate limits
         try:
             resp = requests.get(
                 GNEWS_API_URL,
