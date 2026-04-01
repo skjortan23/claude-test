@@ -73,6 +73,11 @@ Return a JSON array ranking the top 10 most relevant articles. Format:
   }}
 ]
 
+IMPORTANT: Many articles may cover the same story from different sources. When multiple \
+articles cover the same topic/event, only include the SINGLE best one (most detailed or \
+highest quality source). The final list should have 10 DISTINCT stories, not 10 articles \
+about 3 stories.
+
 Only include articles scoring 4 or above. If fewer than 10 qualify, return fewer.
 Return ONLY the JSON array, no other text."""
 
@@ -259,6 +264,50 @@ def deduplicate(articles: list[dict]) -> list[dict]:
     return unique
 
 
+def _title_keywords(title: str) -> set[str]:
+    """Extract significant keywords from a title for similarity matching."""
+    stop_words = {
+        "a", "an", "the", "in", "on", "at", "to", "for", "of", "and", "or",
+        "is", "its", "it", "by", "with", "from", "as", "how", "why", "what",
+        "new", "says", "could", "may", "will", "just", "has", "had", "are",
+        "was", "been", "be", "do", "does", "did", "that", "this", "but",
+    }
+    words = set(re.sub(r"[^a-z0-9\s]", "", title.lower()).split())
+    return words - stop_words
+
+
+def deduplicate_by_topic(articles: list[dict]) -> list[dict]:
+    """Remove articles covering the same story based on title similarity."""
+    unique = []
+    seen_keyword_sets: list[set[str]] = []
+
+    for article in articles:
+        keywords = _title_keywords(article["title"])
+        if len(keywords) < 2:
+            unique.append(article)
+            seen_keyword_sets.append(keywords)
+            continue
+
+        is_duplicate = False
+        for seen_kw in seen_keyword_sets:
+            if len(seen_kw) < 2:
+                continue
+            overlap = len(keywords & seen_kw)
+            similarity = overlap / min(len(keywords), len(seen_kw))
+            if similarity >= 0.6:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            unique.append(article)
+            seen_keyword_sets.append(keywords)
+
+    removed = len(articles) - len(unique)
+    if removed:
+        print(f"Topic dedup removed {removed} duplicate stories.")
+    return unique
+
+
 # --- Ranking ---
 
 
@@ -439,7 +488,9 @@ def main():
     rss_articles = fetch_rss_articles()
 
     all_articles = deduplicate(news_articles + rss_articles)
-    print(f"Total unique articles: {len(all_articles)}")
+    print(f"Unique articles by URL: {len(all_articles)}")
+    all_articles = deduplicate_by_topic(all_articles)
+    print(f"Unique articles by topic: {len(all_articles)}")
 
     if not all_articles:
         print("No articles found. Exiting.")
