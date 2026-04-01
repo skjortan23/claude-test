@@ -15,7 +15,8 @@ import requests
 # --- Configuration ---
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL_FAST = "meta-llama/llama-4-scout-17b-16e-instruct"  # 30K TPM, for ranking
+GROQ_MODEL_CREATIVE = "llama-3.3-70b-versatile"  # 12K TPM, for witty summaries
 
 GNEWS_API_URL = "https://gnews.io/api/v4/search"
 
@@ -113,8 +114,8 @@ Return ONLY the JSON array, no other text."""
 # --- LLM ---
 
 
-def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
-    """Call Groq API with retry on rate limit."""
+def _call_groq(prompt: str, model: str = GROQ_MODEL_FAST, max_tokens: int = 4096) -> str:
+    """Call Groq API with retry on rate limit using retry-after header."""
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         raise ValueError("GROQ_API_KEY not set.")
@@ -127,7 +128,7 @@ def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
                 "Content-Type": "application/json",
             },
             json={
-                "model": GROQ_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
                 "temperature": 0.7,
@@ -135,8 +136,8 @@ def _call_groq(prompt: str, max_tokens: int = 4096) -> str:
             timeout=60,
         )
         if resp.status_code == 429:
-            wait = 10 * (attempt + 1)
-            print(f"Groq rate limited, waiting {wait}s...")
+            wait = int(resp.headers.get("retry-after", 15))
+            print(f"Groq rate limited ({model}), waiting {wait}s (attempt {attempt + 1}/3)...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -328,7 +329,7 @@ def rank_articles(articles: list[dict]) -> list[dict]:
     prompt = RANKING_PROMPT.format(articles=numbered_list)
 
     try:
-        response_text = _call_groq(prompt)
+        response_text = _call_groq(prompt, model=GROQ_MODEL_FAST)
         rankings = _parse_json_response(response_text)
 
         # Merge rankings back into articles
@@ -342,7 +343,7 @@ def rank_articles(articles: list[dict]) -> list[dict]:
                 article["rank"] = entry.get("rank", 0)
                 ranked.append(article)
 
-        print(f"Ranked {len(ranked)} articles via Groq ({GROQ_MODEL}).")
+        print(f"Ranked {len(ranked)} articles via Groq ({GROQ_MODEL_FAST}).")
         return ranked
 
     except Exception as e:
@@ -371,7 +372,7 @@ def generate_witty_summaries(top_articles: list[dict]) -> list[dict]:
     prompt = WITTY_SUMMARY_PROMPT.format(articles=articles_text)
 
     try:
-        response_text = _call_groq(prompt)
+        response_text = _call_groq(prompt, model=GROQ_MODEL_CREATIVE)
         summaries = _parse_json_response(response_text)
 
         for entry in summaries:
@@ -458,7 +459,8 @@ def create_github_issue(ranked_articles: list[dict]) -> None:
 
     body_lines.append("## Methodology")
     body_lines.append(f"- **News sources:** GNews API + {len(RSS_FEEDS)} RSS feeds")
-    body_lines.append(f"- **Ranking model:** {GROQ_MODEL} (via Groq)")
+    body_lines.append(f"- **Ranking model:** {GROQ_MODEL_FAST} (via Groq)")
+    body_lines.append(f"- **Summary model:** {GROQ_MODEL_CREATIVE} (via Groq)")
     body_lines.append(f"- **Generated:** {datetime.datetime.utcnow().isoformat()}Z")
 
     body = "\n".join(body_lines)
