@@ -1,0 +1,33 @@
+name: Daily AI Security News
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 2:00 PM UTC daily
+  workflow_dispatch:       # manual trigger
+
+permissions:
+  issues: write
+
+jobs:
+  fetch-and-rank:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run news fetcher
+        env:
+          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python ai_security_news.py
